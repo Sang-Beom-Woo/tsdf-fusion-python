@@ -17,16 +17,9 @@ except Exception as err:
 
 
 class TSDFVolume:
-  """Volumetric TSDF Fusion of RGB-D Images.
-  """
-  def __init__(self, vol_bnds, voxel_size, use_gpu=True):
-    """Constructor.
 
-    Args:
-      vol_bnds (ndarray): An ndarray of shape (3, 2). Specifies the
-        xyz bounds (min/max) in meters.
-      voxel_size (float): The volume discretization in meters.
-    """
+  def __init__(self, vol_bnds, voxel_size, use_gpu=True):
+
     vol_bnds = np.asarray(vol_bnds)
     assert vol_bnds.shape == (3, 2), "[!] `vol_bnds` should be of shape (3, 2)."
 
@@ -168,8 +161,7 @@ class TSDFVolume:
   @staticmethod
   @njit(parallel=True)
   def vox2world(vol_origin, vox_coords, vox_size):
-    """Convert voxel grid coordinates to world coordinates.
-    """
+
     vol_origin = vol_origin.astype(np.float32)
     vox_coords = vox_coords.astype(np.float32)
     cam_pts = np.empty_like(vox_coords, dtype=np.float32)
@@ -181,8 +173,7 @@ class TSDFVolume:
   @staticmethod
   @njit(parallel=True)
   def cam2pix(cam_pts, intr):
-    """Convert camera coordinates to pixel coordinates.
-    """
+
     intr = intr.astype(np.float32)
     fx, fy = intr[0, 0], intr[1, 1]
     cx, cy = intr[0, 2], intr[1, 2]
@@ -195,8 +186,7 @@ class TSDFVolume:
   @staticmethod
   @njit(parallel=True)
   def integrate_tsdf(tsdf_vol, dist, w_old, obs_weight):
-    """Integrate the TSDF volume.
-    """
+
     tsdf_vol_int = np.empty_like(tsdf_vol, dtype=np.float32)
     w_new = np.empty_like(w_old, dtype=np.float32)
     for i in prange(len(tsdf_vol)):
@@ -204,17 +194,8 @@ class TSDFVolume:
       tsdf_vol_int[i] = (w_old[i] * tsdf_vol[i] + obs_weight * dist[i]) / w_new[i]
     return tsdf_vol_int, w_new
 
-  def integrate(self, color_im, depth_im, cam_intr, cam_pose, obs_weight=1.):
-    """Integrate an RGB-D frame into the TSDF volume.
+  def integrate(self, color_im, depth_im, cam_intr, cam_pose, obs_weight=1., color_intr=None):
 
-    Args:
-      color_im (ndarray): An RGB image of shape (H, W, 3).
-      depth_im (ndarray): A depth image of shape (H, W).
-      cam_intr (ndarray): The camera intrinsics matrix of shape (3, 3).
-      cam_pose (ndarray): The camera pose (i.e. extrinsics) of shape (4, 4).
-      obs_weight (float): The weight to assign for the current observation. A higher
-        value
-    """
     im_h, im_w = depth_im.shape
 
     # Fold RGB color image into a single channel image
@@ -255,18 +236,41 @@ class TSDFVolume:
       pix = self.cam2pix(cam_pts, cam_intr)
       pix_x, pix_y = pix[:, 0], pix[:, 1]
 
+
+
       # Eliminate pixels outside view frustum
       valid_pix = np.logical_and(pix_x >= 0,
                   np.logical_and(pix_x < im_w,
                   np.logical_and(pix_y >= 0,
                   np.logical_and(pix_y < im_h,
                   pix_z > 0))))
+
       depth_val = np.zeros(pix_x.shape)
       depth_val[valid_pix] = depth_im[pix_y[valid_pix], pix_x[valid_pix]]
+
+      # if color_ intrinsic is different,
+      if not len(color_intr) == 0 :
+        color_im_h, color_im_w = color_im.shape
+        color_pix_z = cam_pts[:, 2]
+        color_pix = self.cam2pix(cam_pts, color_intr)
+        color_pix_x, color_pix_y = color_pix[:, 0], color_pix[:, 1]
+        print("using color intrinsic param")
+        color_valid_pix = np.logical_and(color_pix_x >= 0,
+                  np.logical_and(color_pix_x < color_im_w,
+                  np.logical_and(color_pix_y >= 0,
+                  np.logical_and(color_pix_y < color_im_h,
+                  color_pix_z > 0))))
+      else:
+        color_pix_x, color_pix_y = pix[:, 0], pix[:, 1]
+        color_valid_pix = valid_pix
+
+      color_depth_val = np.zeros(color_pix_x.shape)
+      color_depth_val[color_valid_pix] = depth_im[color_pix_y[color_valid_pix], color_pix_x[color_valid_pix]]
 
       # Integrate TSDF
       depth_diff = depth_val - pix_z
       valid_pts = np.logical_and(depth_val > 0, depth_diff >= -self._trunc_margin)
+
       dist = np.minimum(1, depth_diff / self._trunc_margin)
       valid_vox_x = self.vox_coords[valid_pts, 0]
       valid_vox_y = self.vox_coords[valid_pts, 1]
@@ -278,19 +282,28 @@ class TSDFVolume:
       self._weight_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = w_new
       self._tsdf_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = tsdf_vol_new
 
+      color_depth_diff = color_depth_val - color_pix_z
+      color_valid_pts = np.logical_and(color_depth_val > 0, color_depth_diff >= -self._trunc_margin)
+      color_valid_vox_x = self.vox_coords[color_valid_pts, 0]
+      color_valid_vox_y = self.vox_coords[color_valid_pts, 1]
+      color_valid_vox_z = self.vox_coords[color_valid_pts, 2]
+      color_w_old = self._weight_vol_cpu[color_valid_vox_x, color_valid_vox_y, color_valid_vox_z]
       # Integrate color
-      old_color = self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z]
+      old_color = self._color_vol_cpu[color_valid_vox_x, color_valid_vox_y, color_valid_vox_z]
       old_b = np.floor(old_color / self._color_const)
       old_g = np.floor((old_color-old_b*self._color_const)/256)
       old_r = old_color - old_b*self._color_const - old_g*256
-      new_color = color_im[pix_y[valid_pts],pix_x[valid_pts]]
+
+      new_color = color_im[color_pix_y[color_valid_pts],color_pix_x[color_valid_pts]]
+
       new_b = np.floor(new_color / self._color_const)
       new_g = np.floor((new_color - new_b*self._color_const) /256)
       new_r = new_color - new_b*self._color_const - new_g*256
-      new_b = np.minimum(255., np.round((w_old*old_b + obs_weight*new_b) / w_new))
-      new_g = np.minimum(255., np.round((w_old*old_g + obs_weight*new_g) / w_new))
-      new_r = np.minimum(255., np.round((w_old*old_r + obs_weight*new_r) / w_new))
-      self._color_vol_cpu[valid_vox_x, valid_vox_y, valid_vox_z] = new_b*self._color_const + new_g*256 + new_r
+      new_b = np.minimum(255., np.round((color_w_old*old_b + obs_weight*new_b) / (color_w_old + obs_weight)))
+      new_g = np.minimum(255., np.round((color_w_old*old_g + obs_weight*new_g) / (color_w_old + obs_weight)))
+      new_r = np.minimum(255., np.round((color_w_old*old_r + obs_weight*new_r) / (color_w_old + obs_weight)))
+      self._color_vol_cpu[color_valid_vox_x, color_valid_vox_y, color_valid_vox_z] = new_b*self._color_const + new_g*256 + new_r
+
 
   def get_volume(self):
     if self.gpu_mode:
@@ -299,12 +312,10 @@ class TSDFVolume:
     return self._tsdf_vol_cpu, self._color_vol_cpu
 
   def get_point_cloud(self):
-    """Extract a point cloud from the voxel volume.
-    """
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts = measure.marching_cubes_lewiner(tsdf_vol, level=0)[0]
+    verts = measure.marching_cubes(tsdf_vol, level=0, method="lewiner")[0]
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size + self._vol_origin
 
@@ -320,12 +331,11 @@ class TSDFVolume:
     return pc
 
   def get_mesh(self):
-    """Compute a mesh from the voxel volume using marching cubes.
-    """
+
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts, faces, norms, vals = measure.marching_cubes_lewiner(tsdf_vol, level=0)
+    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, level=0, method="lewiner")
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
 
@@ -340,6 +350,7 @@ class TSDFVolume:
 
 
 def rigid_transform(xyz, transform):
+
   """Applies a rigid transform to an (N, 3) pointcloud.
   """
   xyz_h = np.hstack([xyz, np.ones((len(xyz), 1), dtype=np.float32)])
@@ -348,8 +359,7 @@ def rigid_transform(xyz, transform):
 
 
 def get_view_frustum(depth_im, cam_intr, cam_pose):
-  """Get corners of 3D camera view frustum of depth image
-  """
+
   im_h = depth_im.shape[0]
   im_w = depth_im.shape[1]
   max_depth = np.max(depth_im)
@@ -363,8 +373,7 @@ def get_view_frustum(depth_im, cam_intr, cam_pose):
 
 
 def meshwrite(filename, verts, faces, norms, colors):
-  """Save a 3D mesh to a polygon .ply file.
-  """
+
   # Write header
   ply_file = open(filename,'w')
   ply_file.write("ply\n")
